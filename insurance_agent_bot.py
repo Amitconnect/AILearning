@@ -79,7 +79,7 @@ try:
         site="Insurance advisor",
         title="Insurance Advisor Assistant",
         main=[chat_interface],
-        header_background="#D22B2B", # A pizza-sauce red color
+        header_background=" #0D3B66", 
         sidebar_footer="""
         <div style='text-align: center; color: #A0A0A0;'>
             Powered by <b>Google Gemini</b> & <b>Panel</b>
