@@ -1,0 +1,248 @@
+import os
+import sys
+import time
+from pinecone import Pinecone
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import google.generativeai as genai
+from sentence_transformers import CrossEncoder
+import gradio as gr
+
+# --- 1. Configuration and API Key Setup ---
+
+# Set up your Google API key from environment variables
+try:
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("API key not found. Please set the GOOGLE_API_KEY environment variable.")
+    genai.configure(api_key=api_key)
+    print("✅ Google Generative AI configured.")
+except Exception as e:
+    # Gradio will display this message if the application fails to start
+    print(f"🔴 Application Error: {e}")
+    sys.exit(1)
+
+# Set up your Pinecone API key and environment
+# Replace 'YOUR_PINEONE_API_KEY' with your actual Pinecone API key.
+try:
+    pinecone_api_key = os.environ.get("PINECONE_API_KEY")
+    if not pinecone_api_key:
+        raise ValueError("Pinecone API key not found. Please provide it.")
+    pc = Pinecone(api_key=pinecone_api_key)
+    print("✅ Pinecone client initialized.")
+except Exception as e:
+    # Gradio will display this message if the application fails to start
+    print(f"🔴 Pinecone Error: {e}")
+    sys.exit(1)
+
+# Initialize the embedding model and the generative model
+embedding_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-exp-03-07")
+print("✅ Embedding model loaded.")
+# Use the Gemini Pro model for text generation
+llm = genai.GenerativeModel("gemini-1.5-flash")
+print("✅ Generative model (gemini-1.5-flash) loaded.")
+
+# --- Reranker Model ---
+# This is the key change. We load a free Hugging Face model.
+reranker = CrossEncoder('BAAI/bge-reranker-base')
+print("✅ Reranker model (BAAI/bge-reranker-base) loaded.")
+
+# --- 2. Separate Processing and Querying Functions ---
+
+def process_website(website_url, state):
+    """
+    Loads and processes the website, and builds the Pinecone index.
+    The index name is returned and stored in Gradio's state.
+    """
+    if not website_url:
+        return "Please enter a website URL first."
+
+    try:
+        # Load the website content using WebBaseLoader
+        loader = WebBaseLoader(website_url)
+        docs = loader.load()
+        print(f"✅ Loaded {len(docs)} pages from {website_url}.")
+    except Exception as e:
+        return f"🔴 Document Loading Error: {e}"
+
+    # Split the documents into chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+    splits = text_splitter.split_documents(docs)
+    print(f"✅ Split document into {len(splits)} chunks.")
+
+    # --- 3. Pinecone Indexing ---
+    index_name = "rag-website-index"
+    state['index_name'] = index_name # Store the static index name in the state
+    
+    # Check if the index already exists before creating it
+    if pc.has_index(index_name):
+        pc.delete_index(index_name)
+        print(f"⚠️ Existing index '{index_name}' deleted. Waiting for it to be removed...")
+        # Wait until the index is no longer in the list to avoid a conflict
+    
+    # Create a new Pinecone index
+    pc.create_index(
+        name=index_name,
+        dimension=3072, # Dimension for the Gemini embedding model
+        metric="cosine",
+        spec={"serverless": {"cloud": "aws", "region": "us-east-1"}}
+    )
+    index = pc.Index(index_name)
+    print(f"✅ Pinecone index '{index_name}' created.")
+
+    # Upsert the embeddings into Pinecone
+    print("🚀 Upserting chunks into Pinecone...")
+    vectors = []
+    for i, doc in enumerate(splits):
+        chunk_text = doc.page_content
+        embedding = embedding_model.embed_query(chunk_text)
+        
+        vectors.append({
+            "id": f"doc-{i}", # Use a simple ID for this example
+            "values": embedding,
+            "metadata": {"text": chunk_text}
+        })
+    index.upsert(vectors=vectors)
+    print(f"✅ Successfully upserted {len(vectors)} embeddings.")
+
+    stats = index.describe_index_stats()
+    print("--- Index Statistics ---")
+    print(stats)
+    
+    return f"✅ Website processed! Ready to answer questions from the provided URL."
+
+
+def generate_response(query_text, state):
+    """
+    Performs the semantic search on the existing Pinecone index, reranks the results
+    using a local model, and then generates a final answer with a language model.
+    """
+    index_name = state.get('index_name')
+    if not index_name:
+        return "Please process a website first."
+    
+    if not query_text.strip():
+        return "Please enter a query."
+
+    try:
+        index = pc.Index(index_name)
+    except Exception as e:
+        return f"🔴 Pinecone Error: Could not connect to index '{index_name}'. {e}"
+
+    # --- 4. Semantic Search ---
+    query_vector = embedding_model.embed_query(query_text)
+
+    # 1. Retrieve a larger set of documents for reranking
+    initial_top_k = 20
+    results = index.query(
+        vector=query_vector,
+        top_k=initial_top_k,
+        include_metadata=True
+    )
+
+    if not results['matches']:
+        return "No matches found."
+
+    # --- Reranking Step ---
+    # 2. Prepare the pairs of (query, document) for the reranker model
+    passages = [match['metadata'].get('text', '') for match in results['matches']]
+    model_inputs = [[query_text, passage] for passage in passages]
+    
+    # 3. Use the BGE reranker model to score the documents
+    try:
+        scores = reranker.predict(model_inputs)
+    except Exception as e:
+        return f"🔴 Reranking Error: {e}"
+
+    # 4. Combine scores with the original documents and sort
+    reranked_documents = sorted(zip(scores, passages), key=lambda x: x[0], reverse=True)
+    
+    # Select the top 3 most relevant documents after reranking
+    top_k_reranked = 10
+    top_reranked_chunks = [doc for score, doc in reranked_documents[:top_k_reranked]]
+
+    # --- 5. Generate a response using the top reranked chunks ---
+    # Combine the retrieved text into a single context string
+    retrieved_context = "\n---\n".join(top_reranked_chunks)
+    
+    # Construct a prompt for the language model
+    prompt = f"""
+    You are a helpful assistant. Use the following pieces of context to answer the question at the end.
+    If you don't know the answer, just say that you don't know, don't try to make up an answer.
+    
+    Context:
+    {retrieved_context}
+    
+    Question: {query_text}
+    
+    Answer:
+    """
+
+    # Generate the response
+    try:
+        response = llm.generate_content(prompt)
+        generated_text = response.candidates[0].content.parts[0].text
+    except Exception as e:
+        return f"🔴 Generation Error: {e}"
+
+    # Prepare the final output string, including the answer and the source chunks
+    final_output = f"**Answer:**\n{generated_text}\n\n"
+    final_output += "**Sources (Reranked Chunks):**\n"
+    for i, chunk in enumerate(top_reranked_chunks):
+    #   final_output += f"--- Reranked Source {i+1} ---\n"
+        final_output += f"{chunk}\n\n"
+
+    return final_output
+
+
+# --- 6. Gradio Interface (using Blocks) ---
+with gr.Blocks(title="RAG-powered Website Q&A") as demo:
+    gr.Markdown(
+        """
+        # RAG-powered Website Q&A
+        Enter a website URL and process it to create a searchable index. Then, ask questions about its content.
+        This app separates the document processing from the querying, allowing for multiple queries on the same document.
+        """
+    )
+    
+    state = gr.State({})  # Initialize state for storing the index name
+
+    with gr.Row():
+        website_url = gr.Textbox(label="1. Enter Website URL")
+        process_button = gr.Button("Process Website")
+    
+    status_output = gr.Textbox(label="Processing Status")
+    
+    with gr.Column():
+        gr.Markdown("---")
+        query_text = gr.Textbox(
+            label="2. Enter your query here...", 
+            lines=2, 
+            placeholder="E.g., What are the key findings of this report?"
+        )
+        query_button = gr.Button("Search")
+        
+    results_output = gr.Textbox(label="Query Results", lines=10)
+
+    # Define the data flow using event listeners
+    process_button.click(
+        fn=process_website,
+        inputs=[website_url, state],
+        outputs=status_output,
+        # Set a long timeout for the processing step
+        api_name="process_website"
+    )
+    
+    query_button.click(
+        fn=generate_response,
+        inputs=[query_text, state],
+        outputs=results_output,
+        api_name="generate_response"
+    )
+
+if __name__ == "__main__":
+    demo.launch()
